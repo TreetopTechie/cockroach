@@ -1,0 +1,96 @@
+name: Bazel Targets Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      go_binaries: ${{ steps.go-binaries.outputs.go_binaries }}
+    steps:
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        with:
+          path: pr
+      
+      - name: Checkout Base Branch
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: base
+        
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: Install bazel-diff
+        run: |
+          curl -Lo bazel-diff.jar https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff_deploy.jar
+          java -jar bazel-diff.jar -h
+      
+      - name: Bazel-diff Generate Hashes For PR
+        run: |
+          java -jar bazel-diff.jar generate-hashes --workspacePath pr --bazelPath $(which bazel) final-hashes.json
+
+      - name: Bazel-diff Generate Hashes For Base
+        run: |
+          java -jar bazel-diff.jar generate-hashes --workspacePath base --bazelPath $(which bazel) starting-hashes.json
+
+      - name: Get Impacted Targets
+        run: |
+          java -jar bazel-diff.jar get-impacted-targets -sh starting-hashes.json -fh final-hashes.json -o impacted-targets
+          cat impacted-targets
+          
+      - name: Filter for go_binary Targets
+        id: go-binaries
+        run: |
+          cd pr
+          impacted=$(cat ../impacted-targets)
+
+          go_binaries="["
+          first=true
+          for target in $impacted; do
+            if bazel query "kind('go_binary', $target)" --output=label_kind | grep -q 'go_binary'; then
+              trimmed=$(echo "$target" | xargs)
+              if [ "$first" = true ]; then
+                go_binaries+="\"$trimmed\""
+                first=false
+              else
+                go_binaries+=",\"$trimmed\""
+              fi
+            fi
+          done
+          go_binaries+="]"
+
+          echo "Impacted Go Binary Targets:"
+          echo "$go_binaries"
+
+          echo "go_binaries=$go_binaries" >> $GITHUB_OUTPUT
+
+  scan:
+    needs: detect
+    permissions:
+      id-token: write 
+      contents: read 
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.detect.outputs.go_binaries)}}
+    steps:
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        
+      - name: Endor Scan Targets
+        uses: endorlabs/github-action@main
+        with: 
+          namespace: 'david-learn'
+          scan_dependencies: true
+          pr: false
+          scan_summary_output_type: 'table'
+          additional_args: "--use-bazel --bazel-include-targets=${{ matrix.target }}"
